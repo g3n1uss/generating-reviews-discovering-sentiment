@@ -213,7 +213,8 @@ if __name__ == '__main__':
         'bad movie',
         'it was a great book',
         'actors were terrible',
-        'it was ok'
+        'it was ok',
+        'worst movie ever!'
     ]
     text_features = mdl.transform(text)
     sentiment = text_features[:, 2388]
