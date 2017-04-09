@@ -206,7 +206,17 @@ class Model(object):
 
 
 if __name__ == '__main__':
+
     mdl = Model()
-    text = ['demo!']
+    # text = ['demo!']
+    text = [
+        'bad movie',
+        'it was a great book',
+        'actors were terrible',
+        'it was ok'
+    ]
     text_features = mdl.transform(text)
-    print(text_features.shape)
+    sentiment = text_features[:, 2388]
+    print('sentiments')
+    print(sentiment)
+
