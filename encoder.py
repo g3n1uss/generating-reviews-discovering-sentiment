@@ -66,7 +66,7 @@ def mlstm(inputs, c, h, M, ndim, scope='lstm', wn=False):
 def model(X, S, M=None, reuse=False):
     """
     Unstack internal and hidden states, run mLSTM and stack back
-    
+
     :param X: input sentences represented as sequences of ASCII values
     :param S: outputs?
     :param M: binary encoding of sentences
