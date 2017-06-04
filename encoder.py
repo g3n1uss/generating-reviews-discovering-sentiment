@@ -2,9 +2,6 @@ import time
 import numpy as np
 import tensorflow as tf
 
-from tqdm import tqdm
-from sklearn.externals import joblib
-
 from utils import HParams, preprocess, iter_data
 
 global nloaded
@@ -23,23 +20,6 @@ def embd(X, ndim, scope='embedding'):
             "w", [hps.nvocab, ndim], initializer=load_params)
         h = tf.nn.embedding_lookup(embd, X)
         return h
-
-
-def fc(x, nout, act, wn=False, bias=True, scope='fc'):
-    with tf.variable_scope(scope):
-        nin = x.get_shape()[-1].value
-        w = tf.get_variable("w", [nin, nout], initializer=load_params)
-        if wn:
-            g = tf.get_variable("g", [nout], initializer=load_params)
-        if wn:
-            w = tf.nn.l2_normalize(w, dim=0) * g
-        z = tf.matmul(x, w)
-        if bias:
-            b = tf.get_variable("b", [nout], initializer=load_params)
-            z = z+b
-        h = act(z)
-        return h
-
 
 def mlstm(inputs, c, h, M, ndim, scope='lstm', wn=False):
     nin = inputs[0].get_shape()[1].value
@@ -61,7 +41,6 @@ def mlstm(inputs, c, h, M, ndim, scope='lstm', wn=False):
         wmx = tf.nn.l2_normalize(wmx, dim=0) * gmx
         wmh = tf.nn.l2_normalize(wmh, dim=0) * gmh
 
-    cs = []
     for idx, x in enumerate(inputs):
         m = tf.matmul(x, wmx)*tf.matmul(h, wmh)
         z = tf.matmul(x, wx) + tf.matmul(m, wh) + b
@@ -70,6 +49,7 @@ def mlstm(inputs, c, h, M, ndim, scope='lstm', wn=False):
         f = tf.nn.sigmoid(f)
         o = tf.nn.sigmoid(o)
         u = tf.tanh(u)
+        # if M is None we have pure LSTM
         if M is not None:
             ct = f*c + i*u
             ht = o*tf.tanh(ct)
@@ -80,24 +60,27 @@ def mlstm(inputs, c, h, M, ndim, scope='lstm', wn=False):
             c = f*c + i*u
             h = o*tf.tanh(c)
         inputs[idx] = h
-        cs.append(c)
-    cs = tf.stack(cs)
-    return inputs, cs, c, h
+    return c, h
 
 
 def model(X, S, M=None, reuse=False):
+    """
+    Unstack internal and hidden states, run mLSTM and stack back
+    
+    :param X: input sentences represented as sequences of ASCII values
+    :param S: outputs?
+    :param M: binary encoding of sentences
+    :param reuse:
+    :return states: updated S
+    """
     nsteps = X.get_shape()[1].value
-    cstart, hstart = tf.unstack(S, num=hps.nstates)
+    cstart, hstart = tf.unstack(S, num=hps.nstates) # c - internal state, h - hidden state, M - intermediate state
     with tf.variable_scope('model', reuse=reuse):
         words = embd(X, hps.nembd)
         inputs = [tf.squeeze(v, [1]) for v in tf.split(words, num_or_size_splits=nsteps, axis=1)]
-        hs, cells, cfinal, hfinal = mlstm(
-            inputs, cstart, hstart, M, hps.nhidden, scope='rnn', wn=hps.rnn_wn)
-        hs = tf.reshape(tf.concat(hs, 1), [-1, hps.nhidden])
-        logits = fc(
-            hs, hps.nvocab, act=lambda x: x, wn=hps.out_wn, scope='out')
+        cfinal, hfinal = mlstm(inputs, cstart, hstart, M, hps.nhidden, scope='rnn', wn=hps.rnn_wn)
     states = tf.stack([cfinal, hfinal], 0)
-    return cells, states, logits
+    return states
 
 
 def ceil_round_step(n, step):
@@ -105,13 +88,20 @@ def ceil_round_step(n, step):
 
 
 def batch_pad(xs, nbatch, nsteps):
+    """
+    Input to model.transform(["text"]) is output of this function.
+    :param xs: list of sentences, each encoded as a sequence of ASCII values
+    :param nbatch: number of input sentences?
+    :param nsteps: 64, what is this?
+    :return xmb, mmb: sentences as sequences of ASCII values, binary indicators of presence of char
+    """
     xmb = np.zeros((nbatch, nsteps), dtype=np.int32)
     mmb = np.ones((nbatch, nsteps, 1), dtype=np.float32)
     for i, x in enumerate(xs):
         l = len(x)
         npad = nsteps-l
-        xmb[i, -l:] = list(x)
-        mmb[i, :npad] = 0
+        xmb[i, -l:] = list(x) # ASCII values of each character, filled starting from the end
+        mmb[i, :npad] = 0 # 1 - if there is a symbol in xmb, 0 if no
     return xmb, mmb
 
 
@@ -137,10 +127,10 @@ class Model(object):
         params[2] = np.concatenate(params[2:6], axis=1)
         params[3:6] = []
 
-        X = tf.placeholder(tf.int32, [None, hps.nsteps])
-        M = tf.placeholder(tf.float32, [None, hps.nsteps, 1])
-        S = tf.placeholder(tf.float32, [hps.nstates, None, hps.nhidden])
-        cells, states, logits = model(X, S, M, reuse=False)
+        X = tf.placeholder(tf.int32, [None, hps.nsteps]) # input
+        M = tf.placeholder(tf.float32, [None, hps.nsteps, 1]) # intermediate state
+        S = tf.placeholder(tf.float32, [hps.nstates, None, hps.nhidden]) # internal and hidden states
+        states = model(X, S, M, reuse=False)
 
         sess = tf.Session()
         tf.global_variables_initializer().run(session=sess)
@@ -148,24 +138,22 @@ class Model(object):
         def seq_rep(xmb, mmb, smb):
             return sess.run(states, {X: xmb, M: mmb, S: smb})
 
-        def seq_cells(xmb, mmb, smb):
-            return sess.run(cells, {X: xmb, M: mmb, S: smb})
-
         def transform(xs):
             tstart = time.time()
             xs = [preprocess(x) for x in xs]
             lens = np.asarray([len(x) for x in xs])
             sorted_idxs = np.argsort(lens)
             unsort_idxs = np.argsort(sorted_idxs)
-            sorted_xs = [xs[i] for i in sorted_idxs]
+            sorted_xs = [xs[i] for i in sorted_idxs] # here we sort input sentences by length, why?
             maxlen = np.max(lens)
             offset = 0
-            n = len(xs)
-            smb = np.zeros((2, n, hps.nhidden), dtype=np.float32)
+            n = len(xs) # number of input sentences
+            smb = np.zeros((2, n, hps.nhidden), dtype=np.float32) # outputs
+            # what is the second matrix smb[1, unsort_idxs, :]? it stores hidden states
             for step in range(0, ceil_round_step(maxlen, nsteps), nsteps):
                 start = step
                 end = step+nsteps
-                xsubseq = [x[start:end] for x in sorted_xs]
+                xsubseq = [x[start:end] for x in sorted_xs] # pick first 64 characters in each sentence, why?
                 ndone = sum([x == b'' for x in xsubseq])
                 offset += ndone
                 xsubseq = xsubseq[ndone:]
@@ -175,6 +163,7 @@ class Model(object):
                 for batch in range(0, nsubseq, nbatch):
                     start = batch
                     end = batch+nbatch
+                    # if number of input sentences is smaller than "nbatch" xmb[start:end]=xmb
                     batch_smb = seq_rep(
                         xmb[start:end], mmb[start:end],
                         smb[:, offset+start:offset+end, :])
@@ -183,32 +172,11 @@ class Model(object):
             print('%0.3f seconds to transform %d examples' %
                   (time.time() - tstart, n))
             return features
-
-        def cell_transform(xs, indexes=None):
-            Fs = []
-            xs = [preprocess(x) for x in xs]
-            for xmb in tqdm(
-                    iter_data(xs, size=hps.nbatch), ncols=80, leave=False,
-                    total=len(xs)//hps.nbatch):
-                smb = np.zeros((2, hps.nbatch, hps.nhidden))
-                n = len(xmb)
-                xmb, mmb = batch_pad(xmb, hps.nbatch, hps.nsteps)
-                smb = sess.run(cells, {X: xmb, S: smb, M: mmb})
-                smb = smb[:, :n, :]
-                if indexes is not None:
-                    smb = smb[:, :, indexes]
-                Fs.append(smb)
-            Fs = np.concatenate(Fs, axis=1).transpose(1, 0, 2)
-            return Fs
-
         self.transform = transform
-        self.cell_transform = cell_transform
-
 
 if __name__ == '__main__':
 
     mdl = Model()
-    # text = ['demo!']
     text = [
         'bad movie',
         'it was a great book',
